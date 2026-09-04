@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       grammy:
-        specifier: ^1.46.0
+        specifier: 1.46.0
         version: 1.46.0
     devDependencies:
       '@cloudflare/workers-types':

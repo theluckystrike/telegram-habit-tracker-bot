@@ -1,7 +1,8 @@
 import { Bot, Context, InlineKeyboard } from "grammy";
 import { Env as KitEnv, PRO_STARS, ProSpec, displayName, isPrivate, makeFetch, now, preparedShare, proButton, sendInvoice } from "./kit.ts";
+import { GuestReply, wireGuest, wireInline } from "./guest.ts";
 import { Store, Habit } from "./db.ts";
-import { checkIn, dayIndex, escapeMd, flame, isProActive, isRealSender, isSourcePayload, parseHour, parseTz, recapLines, recapTotals, shareText, weekDays } from "./logic.ts";
+import { checkIn, dayIndex, escapeMd, flame, guestPitch, isProActive, isRealSender, isSourcePayload, parseHour, parseTz, recapLines, recapTotals, shareText, weekDays } from "./logic.ts";
 import { APP_HTML, buildShareText, validateInitData } from "./webapp.ts";
 import { langOf, t } from "./i18n.ts";
 export { Store };
@@ -173,6 +174,12 @@ async function prompt(env: Env): Promise<number> {
   return sent;
 }
 
+/** Guest Mode: someone @-mentioned HabitStreak in a chat it was never added to. Streaks
+ * are per-user state, so every summon gets the localized pitch. */
+async function onGuest(ctx: Context): Promise<GuestReply> {
+  return guestPitch(langOf(ctx.from?.language_code));
+}
+
 function buildBot(env: Env): Bot {
   const bot = new Bot(env.BOT_TOKEN);
   // Real-sender guard: only real messages (never channel posts), never the anonymous-admin
@@ -228,6 +235,29 @@ function buildBot(env: Env): Bot {
   bot.on("message:successful_payment", (ctx) => onSuccessfulPayment(ctx, env));
   bot.callbackQuery(/^done:(\d+)$/, (ctx) => onDone(ctx, env, Number(ctx.match[1])));
   m.on("message:text", (ctx) => { if (isPrivate(ctx)) return ctx.reply(help(ctx.from.language_code), { parse_mode: "Markdown" }); });
+  wireGuest(bot, {
+    botUsername: BOT_NAME,
+    reply: (ctx) => onGuest(ctx),
+    // `guest` is NOT written to `sources` here (REVIEW-GUEST F3): a summoner is not an
+    // installer. src_guest is earned later, through the ?start=guest deep link in the
+    // buttons below. recordGuest self-limits; `flood` downgrades us to the cheap pitch.
+    record: async (uid, chatType, chatId) => {
+      const r = await store(env).recordGuest(uid, chatType, chatId);
+      if (r.recorded) await store(env).track(uid, "guest");
+      return !r.flood;
+    },
+  });
+  // Classic inline mode: the SAME reply builder, answered as an inline result. A user types
+  // "@Bot query" in any chat on any client and posts the card with `via @Bot` attribution —
+  // no admin, no membership, no Guest Chat Mode toggle. The destination chat is unknown, so
+  // the card carries private-style buttons only. Counted under `inline_queries`; `sources` is
+  // never written here (an inline user is not an installer, same rule as the guest path).
+  wireInline(bot, {
+    botUsername: BOT_NAME,
+    reply: (ctx) => onGuest(ctx),
+    record: async (uid) => !(await store(env).recordInline(uid)).flood,
+    chosen: (uid) => store(env).recordInlineChosen(uid),
+  });
   return bot;
 }
 

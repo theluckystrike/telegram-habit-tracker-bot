@@ -1,5 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { Bot, Context, InlineKeyboard, webhookCallback } from "grammy";
+export { GUEST_SOURCE, INLINE_CHAT_TYPE, SOURCE_PAYLOAD_RE, buildGuestResult, buildInlineResult, cheapPitch, guestAddUrl, guestButtons, guestOpenUrl, guestText, inlineResultId, isGuestGroup, plain, queryText, resolveBotUsername, wireGuest, wireInline } from "./guest.ts";
+export type { GuestButton, GuestOpts, GuestRate, GuestRecord, GuestRecordResult, GuestReply, InlineOpts } from "./guest.ts";
+import { GUEST_FLOOD_MAX, GUEST_ROW_CAP, guestDay, guestFlooded, guestOverflow, guestRateOk, guestWindow, isQaGuest, nextGuestRate } from "./guest.ts";
+import type { GuestRate, GuestRecordResult } from "./guest.ts";
 
 export const PRO_STARS = 150;
 const DAY = 86_400;
@@ -9,10 +13,22 @@ export interface UserRow { id: number; username: string | null; name: string; pr
 export interface FleetStats { users: number; pro: number; active_7d: number; events: number; [k: string]: number; }
 
 const FUNNEL_SQL = `CREATE TABLE IF NOT EXISTS funnel (user_id INTEGER NOT NULL, step TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (user_id, step));`;
-export type Step = "start" | "action" | "pro_prompt" | "invoice" | "paid";
+/** "guest" = summoned into a chat we are not a member of (Guest Mode); it is a first touch,
+ * so it also doubles as a `?start=guest` source payload. */
+export type Step = "start" | "action" | "pro_prompt" | "invoice" | "paid" | "guest";
 export type ShareKind = "story" | "chat";
 const SHARES_SQL = `CREATE TABLE IF NOT EXISTS shares (user_id INTEGER NOT NULL, kind TEXT NOT NULL, ts INTEGER NOT NULL);`;
-const USERS_SQL = FUNNEL_SQL + SHARES_SQL + `CREATE TABLE IF NOT EXISTS users (
+/** Guest Mode storage is deliberately bounded (REVIEW-GUEST F1): `guests` is a rolling
+ * window capped at GUEST_ROW_CAP rows, the totals live in `guest_counters`, `guest_rate`
+ * is the per-user limiter, and `guest_flood` holds one row per 10-minute window. The two
+ * INSERT OR IGNORE selects seed the counters once from any pre-existing rows. */
+const GUESTS_SQL = `CREATE TABLE IF NOT EXISTS guests (user_id INTEGER NOT NULL, chat_type TEXT NOT NULL, ts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS guest_counters (k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS guest_rate (user_id INTEGER PRIMARY KEY, last_ts INTEGER NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS guest_flood (win INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'queries', COUNT(*) FROM guests WHERE NOT (user_id BETWEEN 900000000 AND 900999999);
+INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'ct_' || chat_type, COUNT(*) FROM guests WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY chat_type;`;
+const USERS_SQL = FUNNEL_SQL + SHARES_SQL + GUESTS_SQL + `CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, username TEXT, name TEXT NOT NULL DEFAULT '', pro INTEGER NOT NULL DEFAULT 0,
   paid_charge TEXT, tz_min INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);`;
 
@@ -61,7 +77,7 @@ export class BaseStore extends DurableObject {
   }
   protected funnelStats(): Record<string, number> {
     const rows = this.all<{ step: string; n: number }>("SELECT step, COUNT(*) AS n FROM funnel WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY step");
-    const f: Record<string, number> = { f_start: 0, f_action: 0, f_pro_prompt: 0, f_invoice: 0, f_paid: 0 };
+    const f: Record<string, number> = { f_start: 0, f_action: 0, f_pro_prompt: 0, f_invoice: 0, f_paid: 0, f_guest: 0 };
     for (const r of rows) f["f_" + r.step] = r.n;
     return f;
   }
@@ -85,12 +101,89 @@ export class BaseStore extends DurableObject {
     for (const r of rows) { if (r.kind === "chat") s.shares_chat = r.n; else if (r.kind === "story") s.shares_story = r.n; }
     return s;
   }
+  /** Records one Guest Mode summon, bounded three ways: QA fixtures are never stored, a
+   * user buys at most one row a minute and 30 a day, and a fleet-wide burst trips the
+   * flood guard. An unrecorded query is still answered — `recorded` only drives the funnel
+   * write, `flood` tells wireGuest to answer with the cheapest pitch. */
+  async recordGuest(userId: number, chatType: string, chatId = 0): Promise<GuestRecordResult> {
+    const ts = now();
+    if (isQaGuest(userId, chatId)) return { recorded: false, flood: false };
+    if (guestFlooded(this.bumpGuestFlood(ts))) return { recorded: false, flood: true };
+    const prev = this.one<GuestRate>("SELECT last_ts, day, n FROM guest_rate WHERE user_id = ?1", userId);
+    if (!guestRateOk(prev, ts)) return { recorded: false, flood: false };
+    this.writeGuest(userId, chatType, ts, nextGuestRate(prev, ts));
+    return { recorded: true, flood: false };
+  }
+  /** Records one classic inline query. Same three guards as `recordGuest` (QA fixtures,
+   * per-user rate, fleet-wide flood) and the same `guest_rate` ledger, but it writes only
+   * the `inline_queries` counter: there is no chat to bucket by, no rolling detail table
+   * worth keeping, and nothing here may touch `sources` (an inline user is not an installer). */
+  async recordInline(userId: number): Promise<GuestRecordResult> {
+    const ts = now();
+    if (isQaGuest(userId, 0)) return { recorded: false, flood: false };
+    if (guestFlooded(this.bumpGuestFlood(ts))) return { recorded: false, flood: true };
+    const prev = this.one<GuestRate>("SELECT last_ts, day, n FROM guest_rate WHERE user_id = ?1", userId);
+    if (!guestRateOk(prev, ts)) return { recorded: false, flood: false };
+    const rate = nextGuestRate(prev, ts);
+    this.run(`INSERT INTO guest_rate (user_id, last_ts, day, n) VALUES (?1, ?2, ?3, ?4)
+              ON CONFLICT(user_id) DO UPDATE SET last_ts = ?2, day = ?3, n = ?4`, userId, rate.last_ts, rate.day, rate.n);
+    this.bumpGuestCounter("inline_queries");
+    this.run("DELETE FROM guest_rate WHERE day < ?1", guestDay(ts) - 1);
+    return { recorded: true, flood: false };
+  }
+  /** chosen_inline_result: one counter bump, nothing else. Kept cheap on purpose. */
+  async recordInlineChosen(userId: number): Promise<void> {
+    if (isQaGuest(userId, 0)) return;
+    this.bumpGuestCounter("inline_chosen");
+  }
+  /** One counter row per 10-minute window; every older window is dropped, so this table
+   * holds at most two rows. Returns the arrival count for the current window. */
+  private bumpGuestFlood(ts: number): number {
+    const win = guestWindow(ts);
+    this.run("INSERT INTO guest_flood (win, n) VALUES (?1, 1) ON CONFLICT(win) DO UPDATE SET n = n + 1", win);
+    this.run("DELETE FROM guest_flood WHERE win < ?1", win - 1);
+    const row = this.one<{ n: number }>("SELECT n FROM guest_flood WHERE win = ?1", win);
+    return row?.n ?? GUEST_FLOOD_MAX + 1;
+  }
+  /** The whole recorded write: rolling row, per-user ledger, aggregate counters, trim.
+   * No await between the statements, so the DO applies them as one transaction. */
+  private writeGuest(userId: number, chatType: string, ts: number, rate: GuestRate): void {
+    this.run("INSERT INTO guests (user_id, chat_type, ts) VALUES (?1, ?2, ?3)", userId, chatType, ts);
+    this.run(`INSERT INTO guest_rate (user_id, last_ts, day, n) VALUES (?1, ?2, ?3, ?4)
+              ON CONFLICT(user_id) DO UPDATE SET last_ts = ?2, day = ?3, n = ?4`, userId, rate.last_ts, rate.day, rate.n);
+    this.bumpGuestCounter("queries");
+    this.bumpGuestCounter("ct_" + chatType);
+    this.trimGuests(ts);
+  }
+  private bumpGuestCounter(k: string): void {
+    this.run("INSERT INTO guest_counters (k, n) VALUES (?1, 1) ON CONFLICT(k) DO UPDATE SET n = n + 1", k);
+  }
+  /** Keeps `guests` at GUEST_ROW_CAP rows and drops rate rows older than yesterday, so
+   * neither table can grow without bound however long the bot runs. */
+  private trimGuests(ts: number): void {
+    const c = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM guests");
+    const over = guestOverflow(c?.n ?? 0, GUEST_ROW_CAP);
+    if (over > 0) this.run("DELETE FROM guests WHERE rowid IN (SELECT rowid FROM guests ORDER BY ts, rowid LIMIT ?1)", over);
+    this.run("DELETE FROM guest_rate WHERE day < ?1", guestDay(ts) - 1);
+  }
+  /** Totals come from the counters, not from the rolling table, so trimming never
+   * rewrites history. QA ids are excluded at write time, so no filter is needed here. */
+  protected guestStats(): Record<string, number> {
+    const rows = this.all<{ k: string; n: number }>("SELECT k, n FROM guest_counters");
+    const g: Record<string, number> = { guest_queries: 0, inline_queries: 0, inline_chosen: 0 };
+    for (const r of rows) {
+      if (r.k === "queries") g.guest_queries = r.n;
+      else if (r.k === "inline_queries" || r.k === "inline_chosen") g[r.k] = r.n;
+      else if (r.k.startsWith("ct_")) g["guest_" + r.k.slice(3)] = r.n;
+    }
+    return g;
+  }
   async setTz(id: number, tzMin: number): Promise<void> { this.run("UPDATE users SET tz_min = ?2 WHERE id = ?1", id, tzMin); }
   protected userStats(): { users: number; pro: number; active_7d: number; qa_pro: number; [k: string]: number } {
     const u = this.one<{ n: number; p: number | null; a: number | null }>(
       "SELECT COUNT(*) AS n, SUM(pro) AS p, SUM(last_seen > ?1) AS a FROM users WHERE NOT (id BETWEEN 900000000 AND 900999999)", now() - 7 * DAY);
     const q = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE pro = 1 AND id BETWEEN 900000000 AND 900999999");
-    return { users: u?.n ?? 0, pro: u?.p ?? 0, active_7d: u?.a ?? 0, qa_pro: q?.n ?? 0, ...this.funnelStats(), ...this.ttvStats(), ...this.shareStats() };
+    return { users: u?.n ?? 0, pro: u?.p ?? 0, active_7d: u?.a ?? 0, qa_pro: q?.n ?? 0, ...this.funnelStats(), ...this.ttvStats(), ...this.shareStats(), ...this.guestStats() };
   }
 }
 

@@ -1,3 +1,7 @@
+import { t } from "./i18n.ts";
+import type { Lang } from "./i18n.ts";
+import type { GuestReply } from "./guest.ts";
+
 const DAY = 86_400;
 export const dayIndex = (sec: number, tzMin: number): number => Math.floor((sec + tzMin * 60) / DAY);
 
@@ -110,4 +114,13 @@ export function shareText(totals: RecapTotals): string {
   const line1 = `🔥 ${totals.done}/${totals.possible} check-ins this week`;
   const line2 = totals.bestStreak > 0 ? `Best streak: ${totals.bestStreak} days. Join me on HabitStreak!` : "Starting a fresh week. Join me on HabitStreak!";
   return `${line1}\n${line2}`;
+}
+
+/** Guest Mode pitch: streaks are per-user state (today's check-ins, a running streak),
+ * so nothing useful fits in a one-shot guest reply. Every summon gets the localized
+ * /start pitch, Markdown stripped (guest text carries no parse_mode). Pure — no ctx, no
+ * store — so it is unit-testable under plain node. */
+export function guestPitch(lang: Lang): GuestReply {
+  const plain = t(lang, "start").replaceAll("*", "").replaceAll("`", "");
+  return { title: "🔥 HabitStreak — habit streaks with daily check-ins", description: "Open the bot to start a streak", text: plain };
 }
