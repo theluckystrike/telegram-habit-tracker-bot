@@ -3,13 +3,15 @@ import { Env as KitEnv, PRO_STARS, ProSpec, displayName, isPrivate, makeFetch, n
 import { GuestReply, wireGuest, wireInline } from "./guest.ts";
 import { Store, Habit } from "./db.ts";
 import { checkIn, dayIndex, escapeMd, flame, guestPitch, isProActive, isRealSender, isSourcePayload, parseHour, parseTz, recapLines, recapTotals, shareText, weekDays } from "./logic.ts";
-import { APP_HTML, buildShareText, validateInitData } from "./webapp.ts";
+import { APP_HTML, buildShareText, handleProLink, initDataFailure, validateInitData } from "./webapp.ts";
+import type { ProLinkBody } from "./webapp.ts";
+import type { ProPlan } from "./webapp-i18n.ts";
+import { BOT as BOT_NAME } from "./botname.ts";
 import { langOf, t } from "./i18n.ts";
 export { Store };
 
 const MORE_TEXT = "More free tools by the same maker:\n🔒 @WhisperLockBot — locked messages only one person can open\n⏰ @NudgeRemindBot — reminders that arrive on time\n📮 @AnonInboxProBot — anonymous inbox via your link\n🧾 @SplitTabsBot — split group expenses\n🔥 @HabitStreakProBot — habit streaks with daily check-ins";
 const FREE_HABITS = 3;
-const BOT_NAME = "HabitStreakProBot";
 const SHARE_TEXT = "Daily check-ins and streaks that actually stick, right inside Telegram.";
 interface Env extends KitEnv { STORE: DurableObjectNamespace<Store>; APP_URL?: string; }
 const store = (env: Env) => env.STORE.get(env.STORE.idFromName("main"));
@@ -22,6 +24,10 @@ const PRO: ProSpec = {
 };
 const SUB_STARS = 100;
 const SUB_PERIOD_SEC = 2_592_000; // 30 days, per Telegram's subscription_period unit
+/** The monthly plan, in one place: /pro's "Monthly" button and the Mini App's
+ * POST /api/pro-link must mint the identical invoice, or successful_payment would see a
+ * payload the "-sub" branch does not recognize. */
+const PRO_SUB = { title: "HabitStreak Pro (monthly)", description: "Unlimited habits and streak insurance. Renews monthly.", payload: "habit-sub" };
 const help = (lang: string | undefined): string => t(lang, "help", { n: FREE_HABITS, proStars: PRO_STARS });
 
 function board(habits: Habit[], today: number, lang: string): { text: string; kb: InlineKeyboard } {
@@ -130,18 +136,21 @@ async function sendProMenu(ctx: Context): Promise<void> {
   await ctx.reply(t(lang, "proPitchMenu"), { reply_markup: proMenu(lang) });
 }
 
+/** One Stars invoice link for either plan, with exactly the title/description/payload the
+ * chat flow uses. Shared by /pro's Monthly button and the Mini App's POST /api/pro-link. */
+function proLink(api: Bot["api"], plan: ProPlan): Promise<string> {
+  if (plan === "monthly") {
+    return api.createInvoiceLink(PRO_SUB.title, PRO_SUB.description, PRO_SUB.payload, "", "XTR",
+      [{ label: PRO_SUB.title, amount: SUB_STARS }], { subscription_period: SUB_PERIOD_SEC });
+  }
+  return api.createInvoiceLink(PRO.title, PRO.description, PRO.payload, "", "XTR",
+    [{ label: PRO.title, amount: PRO_STARS }]);
+}
+
 async function sendSubLink(ctx: Context): Promise<void> {
   if (!isPrivate(ctx)) { await sendProInGroup(ctx); return; }
   const lang = langOf(ctx.from?.language_code);
-  const link = await ctx.api.createInvoiceLink(
-    "HabitStreak Pro (monthly)",
-    "Unlimited habits and streak insurance. Renews monthly.",
-    "habit-sub",
-    "",
-    "XTR",
-    [{ label: "HabitStreak Pro (monthly)", amount: SUB_STARS }],
-    { subscription_period: SUB_PERIOD_SEC },
-  );
+  const link = await proLink(ctx.api, "monthly");
   await ctx.reply("Tap to subscribe:", { reply_markup: new InlineKeyboard().url(`${t(lang, "btn_subscribe")} ${SUB_STARS} ⭐/month`, link) });
 }
 
@@ -264,7 +273,7 @@ function buildBot(env: Env): Bot {
 async function api(req: Request, env: Env, path: string): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { initData?: string; id?: number };
   const user = await validateInitData(body.initData ?? "", [env.BOT_TOKEN, env.HUB_BOT_TOKEN].filter((t): t is string => !!t));
-  if (!user) return Response.json({ error: "Open this page from Telegram." }, { status: 401 });
+  if (!user) return Response.json(initDataFailure(body.initData ?? "", `https://t.me/${BOT_NAME}`), { status: 401 });
   const u = await store(env).touchUserFull(user.id, user.username, user.username ? "@" + user.username : user.first_name);
   const today = dayIndex(now(), u.tz_min);
   const pro = isProActive(u.pro, u.pro_until, now());
@@ -273,7 +282,7 @@ async function api(req: Request, env: Env, path: string): Promise<Response> {
     if (h && h.user_id === u.id) { const s = checkIn(h, today, pro); if (s) await store(env).saveStreak(h.id, s); }
   }
   const habits = (await store(env).habits(u.id)).map((h) => ({ id: h.id, name: h.name, streak: h.streak, best: h.best, done: h.last_day === today }));
-  return Response.json({ habits, pro });
+  return Response.json({ habits, pro, proStars: PRO_STARS, subStars: SUB_STARS });
 }
 
 /** POST /api/share: registers a Bot API "prepared" inline message (savePreparedInlineMessage)
@@ -281,7 +290,7 @@ async function api(req: Request, env: Env, path: string): Promise<Response> {
 async function apiShare(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { initData?: string };
   const user = await validateInitData(body.initData ?? "", [env.BOT_TOKEN, env.HUB_BOT_TOKEN].filter((t): t is string => !!t));
-  if (!user) return Response.json({ error: "Open this page from Telegram." }, { status: 401 });
+  if (!user) return Response.json(initDataFailure(body.initData ?? "", `https://t.me/${BOT_NAME}`), { status: 401 });
   try {
     const share = await preparedShare(env, user.id, buildShareText(SHARE_TEXT, BOT_NAME, "shared"), `https://t.me/${BOT_NAME}`);
     await store(env).recordShare(user.id, "chat");
@@ -294,9 +303,22 @@ async function apiShare(req: Request, env: Env): Promise<Response> {
 async function apiShareStory(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { initData?: string };
   const user = await validateInitData(body.initData ?? "", [env.BOT_TOKEN, env.HUB_BOT_TOKEN].filter((t): t is string => !!t));
-  if (!user) return Response.json({ error: "Open this page from Telegram." }, { status: 401 });
+  if (!user) return Response.json(initDataFailure(body.initData ?? "", `https://t.me/${BOT_NAME}`), { status: 401 });
   await store(env).recordShare(user.id, "story");
   return Response.json({ ok: true });
+}
+
+/** POST /api/pro-link: the Mini App's own Stars checkout (tg.openInvoice). Same invoice
+ * as the chat flow, so successful_payment and setProLifetime/setProSubscription are unchanged. */
+async function apiProLink(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => ({}))) as ProLinkBody;
+  return handleProLink(body, {
+    tokens: [env.BOT_TOKEN, env.HUB_BOT_TOKEN].filter((t): t is string => !!t),
+    botLink: `https://t.me/${BOT_NAME}`,
+    allowMonthly: true,
+    mint: (plan) => proLink(new Bot(env.BOT_TOKEN).api, plan),
+    track: (userId) => store(env).track(userId, "invoice"),
+  });
 }
 
 const botFetch = makeFetch<Env>(buildBot, (env) => store(env).stats());
@@ -307,6 +329,7 @@ export default {
     if (path === "/app") return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
     if (path === "/api/share" && req.method === "POST") return apiShare(req, env);
     if (path === "/api/share-story" && req.method === "POST") return apiShareStory(req, env);
+    if (path === "/api/pro-link" && req.method === "POST") return apiProLink(req, env);
     if (path.startsWith("/api/") && req.method === "POST") return api(req, env, path);
     return botFetch(req, env);
   },

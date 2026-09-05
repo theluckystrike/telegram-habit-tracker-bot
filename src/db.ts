@@ -124,11 +124,11 @@ export class Store extends BaseStore {
   async stats(): Promise<FleetStats> {
     const h = this.one<{ n: number; b: number | null }>("SELECT COUNT(*) AS n, MAX(best) AS b FROM habits WHERE archived = 0");
     const c = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM checkins");
-    const sr = this.all<{ src: string; n: number }>("SELECT src, COUNT(*) AS n FROM sources WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY src");
+    const sr = this.all<{ src: string; n: number }>(`SELECT src, COUNT(*) AS n FROM sources WHERE ${this.notTestUser("user_id")} GROUP BY src`);
     const s: Record<string, number> = {};
     for (const r of sr) s["src_" + r.src] = r.n;
-    const sub = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE pro_until IS NOT NULL AND pro_until > ?1 AND NOT (id BETWEEN 900000000 AND 900999999)", now());
-    const rc = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM recaps WHERE NOT (user_id BETWEEN 900000000 AND 900999999)");
+    const sub = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM users WHERE pro_until IS NOT NULL AND pro_until > ?1 AND ${this.notTestUser("id")}`, now());
+    const rc = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM recaps WHERE ${this.notTestUser("user_id")}`);
     return { ...this.userStats(), ...s, events: c?.n ?? 0, habits: h?.n ?? 0, best_streak: h?.b ?? 0, subs_active: sub?.n ?? 0, recaps_sent: rc?.n ?? 0 };
   }
 }

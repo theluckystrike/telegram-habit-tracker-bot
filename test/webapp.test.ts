@@ -38,3 +38,27 @@ test("buildShareText: pitch + attributable deep link, under 300 chars", () => {
   assert.ok(text.includes(`https://t.me/${botUsername}?start=shared`));
   assert.ok(text.startsWith(pitch));
 });
+
+import { APP_HTML } from "../src/webapp.ts";
+import { BOT } from "../src/botname.ts";
+
+// Fleet allowlist: this bot's own username, the 9 LIVE bots' real usernames, and the hub bot.
+// A guessed-looking t.me username that is NOT in this list is always somebody else's live bot
+// (see REVIEW-WEBAPP.md) — the Mini App must never link to one.
+const LIVE_USERNAMES = [
+  "WhisperLockBot", "NudgeRemindBot", "AnonInboxProBot", "SplitTabsBot", "HabitStreakProBot",
+  "EventRSVPProBot", "AnonSayProBot", "IcebreakerDailyBot", "SantaDrawProBot",
+];
+const ALLOWED = new Set([BOT, ...LIVE_USERNAMES, "TinyTelegramToolsBot", "share"]); // "share" = Telegram's own share dialog (t.me/share/url), not a bot
+
+test("served HTML has no tg:// links (rejected by WebApp.openTelegramLink)", () => {
+  assert.equal(APP_HTML.includes("tg://"), false, "found a tg:// link in APP_HTML");
+});
+
+test("served HTML only links to this bot, a LIVE fleet bot, or the hub — never a guessed username", () => {
+  const found = [...APP_HTML.matchAll(/t\.me\/([A-Za-z0-9_]+)/g)].map((m) => m[1]);
+  assert.ok(found.length > 0, "expected at least one t.me link in APP_HTML");
+  for (const name of found) {
+    assert.ok(ALLOWED.has(name), `APP_HTML links to an unallowed username: ${name}`);
+  }
+});

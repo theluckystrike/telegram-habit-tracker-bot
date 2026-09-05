@@ -35,8 +35,23 @@ export const GUEST_FLOOD_WINDOW_S = 600;
 export const GUEST_FLOOD_MAX = 600;
 const DAY_S = 86_400;
 
-export const isQaGuest = (userId: number, chatId: number): boolean =>
-  (userId >= QA_USER_MIN && userId <= QA_USER_MAX) || chatId === QA_CHAT_ID;
+/** `ownerId` (0 when the OWNER_ID secret is unset) excludes the fleet owner's own real
+ * Telegram id from Guest Mode / inline recording the same way the QA range is excluded —
+ * the owner's manual testing must never inflate real user-facing counts. */
+export const isQaGuest = (userId: number, chatId: number, ownerId = 0): boolean =>
+  (userId >= QA_USER_MIN && userId <= QA_USER_MAX) || chatId === QA_CHAT_ID || (ownerId > 0 && userId === ownerId);
+
+/** SQL predicate excluding both the QA fixture range and the fleet owner's own real id from
+ * a user-facing count, in one place — every store (BaseStore and every per-bot db.ts) filters
+ * through this rather than repeating a literal `BETWEEN` clause. `ownerId` is 0 when the
+ * OWNER_ID secret is unset (tests, a fresh clone) so the owner clause is simply never true —
+ * never hardcode the numeric id at a call site. Splices `ownerId` as a literal because it is
+ * trusted config (a Worker secret), never user input, and every call site already has its own
+ * positional (?1, ?2, ...) params this must not collide with. */
+export function notTestUser(col: string, ownerId: number): string {
+  const owner = Number.isInteger(ownerId) && ownerId > 0 ? ` OR ${col} = ${ownerId}` : "";
+  return `NOT (${col} BETWEEN ${QA_USER_MIN} AND ${QA_USER_MAX}${owner})`;
+}
 
 export const guestDay = (ts: number): number => Math.floor(ts / DAY_S);
 export const guestWindow = (ts: number): number => Math.floor(ts / GUEST_FLOOD_WINDOW_S);
@@ -311,4 +326,15 @@ export function wireInline(bot: Bot, opts: InlineOpts): void {
     if (!uid) return;
     try { await chosen(uid); } catch (e) { console.log("inline chosen", String(e).slice(0, 120)); }
   });
+}
+
+/** Pro-callback guard (P1-5): a group-scoped Pro bot's generic `bot.callbackQuery("pro")`
+ * carries no chatId in its payload (`spec.payload` alone, e.g. `"pulse-pro"`), so a payment
+ * made through it can never match the `<payload>:<chatId>` parser its `onPaid` expects and
+ * silently falls through to a user-level `setPro(user)` — the wrong sink, since Pro there is
+ * sold per group, not per person. True means the callback must refuse to mint an invoice at
+ * all and point the tapper at the chat's own `/pro` instead. Pure so it is unit-tested
+ * without a Bot instance. */
+export function proCallbackMustRedirect(groupScoped?: boolean): boolean {
+  return groupScoped === true;
 }

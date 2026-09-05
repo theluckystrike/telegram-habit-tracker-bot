@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { Bot, Context, InlineKeyboard, webhookCallback } from "grammy";
-export { GUEST_SOURCE, INLINE_CHAT_TYPE, SOURCE_PAYLOAD_RE, buildGuestResult, buildInlineResult, cheapPitch, guestAddUrl, guestButtons, guestOpenUrl, guestText, inlineResultId, isGuestGroup, plain, queryText, resolveBotUsername, wireGuest, wireInline } from "./guest.ts";
+export { GUEST_SOURCE, INLINE_CHAT_TYPE, SOURCE_PAYLOAD_RE, buildGuestResult, buildInlineResult, cheapPitch, guestAddUrl, guestButtons, guestOpenUrl, guestText, inlineResultId, isGuestGroup, notTestUser, plain, proCallbackMustRedirect, queryText, resolveBotUsername, wireGuest, wireInline } from "./guest.ts";
 export type { GuestButton, GuestOpts, GuestRate, GuestRecord, GuestRecordResult, GuestReply, InlineOpts } from "./guest.ts";
-import { GUEST_FLOOD_MAX, GUEST_ROW_CAP, guestDay, guestFlooded, guestOverflow, guestRateOk, guestWindow, isQaGuest, nextGuestRate } from "./guest.ts";
+import { GUEST_FLOOD_MAX, GUEST_ROW_CAP, guestDay, guestFlooded, guestOverflow, guestRateOk, guestWindow, isQaGuest, nextGuestRate, notTestUser, proCallbackMustRedirect } from "./guest.ts";
 import type { GuestRate, GuestRecordResult } from "./guest.ts";
 
 export const PRO_STARS = 150;
@@ -22,13 +22,16 @@ const SHARES_SQL = `CREATE TABLE IF NOT EXISTS shares (user_id INTEGER NOT NULL,
  * window capped at GUEST_ROW_CAP rows, the totals live in `guest_counters`, `guest_rate`
  * is the per-user limiter, and `guest_flood` holds one row per 10-minute window. The two
  * INSERT OR IGNORE selects seed the counters once from any pre-existing rows. */
-const GUESTS_SQL = `CREATE TABLE IF NOT EXISTS guests (user_id INTEGER NOT NULL, chat_type TEXT NOT NULL, ts INTEGER NOT NULL);
+/** Table DDL is fixed, but the one-time seed inserts (they only ever fire once, from any
+ * pre-existing rows) must exclude the owner the same as every later read, hence a function
+ * of `ownerId` rather than a plain constant. */
+const guestsSql = (ownerId: number): string => `CREATE TABLE IF NOT EXISTS guests (user_id INTEGER NOT NULL, chat_type TEXT NOT NULL, ts INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS guest_counters (k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS guest_rate (user_id INTEGER PRIMARY KEY, last_ts INTEGER NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS guest_flood (win INTEGER PRIMARY KEY, n INTEGER NOT NULL);
-INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'queries', COUNT(*) FROM guests WHERE NOT (user_id BETWEEN 900000000 AND 900999999);
-INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'ct_' || chat_type, COUNT(*) FROM guests WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY chat_type;`;
-const USERS_SQL = FUNNEL_SQL + SHARES_SQL + GUESTS_SQL + `CREATE TABLE IF NOT EXISTS users (
+INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'queries', COUNT(*) FROM guests WHERE ${notTestUser("user_id", ownerId)};
+INSERT OR IGNORE INTO guest_counters (k, n) SELECT 'ct_' || chat_type, COUNT(*) FROM guests WHERE ${notTestUser("user_id", ownerId)} GROUP BY chat_type;`;
+const usersSql = (ownerId: number): string => FUNNEL_SQL + SHARES_SQL + guestsSql(ownerId) + `CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, username TEXT, name TEXT NOT NULL DEFAULT '', pro INTEGER NOT NULL DEFAULT 0,
   paid_charge TEXT, tz_min INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);`;
 
@@ -43,10 +46,18 @@ export function median(nums: number[]): number {
 }
 
 export class BaseStore extends DurableObject {
+  /** The fleet owner's real Telegram id, from the OWNER_ID secret; 0 (never matches a real
+   * user id) when the secret is unset. Read once at construction, same as BOT_TOKEN. */
+  protected readonly ownerId: number;
   constructor(ctx: DurableObjectState, env: Record<string, unknown>, schema: string) {
     super(ctx, env);
-    ctx.blockConcurrencyWhile(async () => { ctx.storage.sql.exec(USERS_SQL + schema); });
+    this.ownerId = Number((env as { OWNER_ID?: string }).OWNER_ID) || 0;
+    const ownerId = this.ownerId;
+    ctx.blockConcurrencyWhile(async () => { ctx.storage.sql.exec(usersSql(ownerId) + schema); });
   }
+  /** SQL fragment excluding QA fixtures and the owner from a count over `col`. Every
+   * user-facing stat (base and per-bot) must filter through this, never a bare literal. */
+  protected notTestUser(col: string): string { return notTestUser(col, this.ownerId); }
   protected all<T>(sql: string, ...a: unknown[]): T[] {
     return this.ctx.storage.sql.exec(sql, ...(a as SqlStorageValue[])).toArray() as T[];
   }
@@ -76,17 +87,19 @@ export class BaseStore extends DurableObject {
     this.run("INSERT OR IGNORE INTO funnel (user_id, step, ts) VALUES (?1, ?2, ?3)", userId, step, now());
   }
   protected funnelStats(): Record<string, number> {
-    const rows = this.all<{ step: string; n: number }>("SELECT step, COUNT(*) AS n FROM funnel WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY step");
+    const rows = this.all<{ step: string; n: number }>(`SELECT step, COUNT(*) AS n FROM funnel WHERE ${this.notTestUser("user_id")} GROUP BY step`);
     const f: Record<string, number> = { f_start: 0, f_action: 0, f_pro_prompt: 0, f_invoice: 0, f_paid: 0, f_guest: 0 };
     for (const r of rows) f["f_" + r.step] = r.n;
+    const oe = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM funnel WHERE user_id = ?1", this.ownerId);
+    f.owner_events = oe?.n ?? 0;
     return f;
   }
   /** Median seconds from the "start" funnel step to the "action" step, over users who
-   * reached both (QA ids excluded, bounded so a large table can't blow the query up). */
+   * reached both (QA ids and the owner excluded, bounded so a large table can't blow the query up). */
   protected ttvStats(): { ttv_median_s: number } {
     const rows = this.all<{ start_ts: number; action_ts: number }>(
       `SELECT s.ts AS start_ts, a.ts AS action_ts FROM funnel s JOIN funnel a ON a.user_id = s.user_id AND a.step = 'action'
-       WHERE s.step = 'start' AND NOT (s.user_id BETWEEN 900000000 AND 900999999) LIMIT 5000`);
+       WHERE s.step = 'start' AND ${this.notTestUser("s.user_id")} LIMIT 5000`);
     const diffs = rows.map((r) => r.action_ts - r.start_ts).filter((d) => d >= 0);
     return { ttv_median_s: median(diffs) };
   }
@@ -96,7 +109,7 @@ export class BaseStore extends DurableObject {
   }
   protected shareStats(): { shares_chat: number; shares_story: number } {
     const rows = this.all<{ kind: string; n: number }>(
-      "SELECT kind, COUNT(*) AS n FROM shares WHERE NOT (user_id BETWEEN 900000000 AND 900999999) GROUP BY kind");
+      `SELECT kind, COUNT(*) AS n FROM shares WHERE ${this.notTestUser("user_id")} GROUP BY kind`);
     const s = { shares_chat: 0, shares_story: 0 };
     for (const r of rows) { if (r.kind === "chat") s.shares_chat = r.n; else if (r.kind === "story") s.shares_story = r.n; }
     return s;
@@ -107,7 +120,7 @@ export class BaseStore extends DurableObject {
    * write, `flood` tells wireGuest to answer with the cheapest pitch. */
   async recordGuest(userId: number, chatType: string, chatId = 0): Promise<GuestRecordResult> {
     const ts = now();
-    if (isQaGuest(userId, chatId)) return { recorded: false, flood: false };
+    if (isQaGuest(userId, chatId, this.ownerId)) return { recorded: false, flood: false };
     if (guestFlooded(this.bumpGuestFlood(ts))) return { recorded: false, flood: true };
     const prev = this.one<GuestRate>("SELECT last_ts, day, n FROM guest_rate WHERE user_id = ?1", userId);
     if (!guestRateOk(prev, ts)) return { recorded: false, flood: false };
@@ -120,7 +133,7 @@ export class BaseStore extends DurableObject {
    * worth keeping, and nothing here may touch `sources` (an inline user is not an installer). */
   async recordInline(userId: number): Promise<GuestRecordResult> {
     const ts = now();
-    if (isQaGuest(userId, 0)) return { recorded: false, flood: false };
+    if (isQaGuest(userId, 0, this.ownerId)) return { recorded: false, flood: false };
     if (guestFlooded(this.bumpGuestFlood(ts))) return { recorded: false, flood: true };
     const prev = this.one<GuestRate>("SELECT last_ts, day, n FROM guest_rate WHERE user_id = ?1", userId);
     if (!guestRateOk(prev, ts)) return { recorded: false, flood: false };
@@ -133,7 +146,7 @@ export class BaseStore extends DurableObject {
   }
   /** chosen_inline_result: one counter bump, nothing else. Kept cheap on purpose. */
   async recordInlineChosen(userId: number): Promise<void> {
-    if (isQaGuest(userId, 0)) return;
+    if (isQaGuest(userId, 0, this.ownerId)) return;
     this.bumpGuestCounter("inline_chosen");
   }
   /** One counter row per 10-minute window; every older window is dropped, so this table
@@ -179,11 +192,19 @@ export class BaseStore extends DurableObject {
     return g;
   }
   async setTz(id: number, tzMin: number): Promise<void> { this.run("UPDATE users SET tz_min = ?2 WHERE id = ?1", id, tzMin); }
-  protected userStats(): { users: number; pro: number; active_7d: number; qa_pro: number; [k: string]: number } {
+  /** `qa_pro` mirrors the synthetic-payment smoke test (a QA-range id flipped Pro); `owner_users`
+   * / `owner_pro` mirror it for the fleet owner's own real id, so a real owner purchase still
+   * flips Pro and still shows up — just filed as "yours" in the Registry, never under `users`/`pro`. */
+  protected userStats(): { users: number; pro: number; active_7d: number; qa_pro: number; owner_users: number; owner_pro: number; [k: string]: number } {
     const u = this.one<{ n: number; p: number | null; a: number | null }>(
-      "SELECT COUNT(*) AS n, SUM(pro) AS p, SUM(last_seen > ?1) AS a FROM users WHERE NOT (id BETWEEN 900000000 AND 900999999)", now() - 7 * DAY);
+      `SELECT COUNT(*) AS n, SUM(pro) AS p, SUM(last_seen > ?1) AS a FROM users WHERE ${this.notTestUser("id")}`, now() - 7 * DAY);
     const q = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE pro = 1 AND id BETWEEN 900000000 AND 900999999");
-    return { users: u?.n ?? 0, pro: u?.p ?? 0, active_7d: u?.a ?? 0, qa_pro: q?.n ?? 0, ...this.funnelStats(), ...this.ttvStats(), ...this.shareStats(), ...this.guestStats() };
+    const o = this.one<{ n: number; p: number | null }>("SELECT COUNT(*) AS n, SUM(pro) AS p FROM users WHERE id = ?1", this.ownerId);
+    return {
+      users: u?.n ?? 0, pro: u?.p ?? 0, active_7d: u?.a ?? 0, qa_pro: q?.n ?? 0,
+      owner_users: o?.n ?? 0, owner_pro: o?.p ?? 0,
+      ...this.funnelStats(), ...this.ttvStats(), ...this.shareStats(), ...this.guestStats(),
+    };
   }
 }
 
@@ -196,11 +217,21 @@ export async function sendInvoice(ctx: Context, spec: ProSpec, payload = spec.pa
 
 export const proButton = (text = "Unlock Pro"): InlineKeyboard => new InlineKeyboard().text(text, "pro");
 
-/** /pro, "pro" callback, pre_checkout, successful_payment (user-level Pro). */
-export function wirePro(bot: Bot, spec: ProSpec, onPaid: (ctx: Context, payload: string, charge: string) => Promise<void>, track?: (uid: number, s: Step) => Promise<void>): void {
+/** /pro, "pro" callback, pre_checkout, successful_payment. `groupScoped` (P1-5) must be set
+ * true by any bot whose Pro is sold per-chat (its own `onPaid` matches a `<payload>:<chatId>`
+ * suffix and falls back to a user-level setPro on a miss): the generic callback carries no
+ * chatId, so it must never mint that bare-payload invoice — it would misattribute a group's
+ * purchase to whichever member happened to tap it. Such bots already shadow `/pro` with their
+ * own chat-aware command; this only closes the "pro" callback_data as a second, unshadowed
+ * entry point. */
+export function wirePro(bot: Bot, spec: ProSpec, onPaid: (ctx: Context, payload: string, charge: string) => Promise<void>, track?: (uid: number, s: Step) => Promise<void>, groupScoped?: boolean): void {
   const t = (ctx: Context) => (s: Step) => (track ? track(ctx.from!.id, s) : Promise.resolve());
   bot.command("pro", (ctx) => sendInvoice(ctx, spec, spec.payload, t(ctx)));
-  bot.callbackQuery("pro", async (ctx) => { await ctx.answerCallbackQuery(); await sendInvoice(ctx, spec, spec.payload, t(ctx)); });
+  bot.callbackQuery("pro", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (proCallbackMustRedirect(groupScoped)) { await ctx.reply("Run /pro in this chat to unlock Pro here."); return; }
+    await sendInvoice(ctx, spec, spec.payload, t(ctx));
+  });
   bot.on("pre_checkout_query", (ctx) => ctx.answerPreCheckoutQuery(true));
   bot.on("message:successful_payment", async (ctx) => {
     const sp = ctx.message.successful_payment;
@@ -210,7 +241,10 @@ export function wirePro(bot: Bot, spec: ProSpec, onPaid: (ctx: Context, payload:
   });
 }
 
-export interface Env { BOT_TOKEN: string; WEBHOOK_SECRET: string; HUB_BOT_TOKEN?: string; STORE: DurableObjectNamespace<any>; }
+/** OWNER_ID: the fleet owner's real Telegram user id, as a Worker secret (a string, like
+ * every wrangler secret) — optional so tests and a fresh clone still typecheck and run with
+ * it unset (BaseStore then treats the owner clause as never-true). Never hardcode the id. */
+export interface Env { BOT_TOKEN: string; WEBHOOK_SECRET: string; HUB_BOT_TOKEN?: string; OWNER_ID?: string; STORE: DurableObjectNamespace<any>; }
 
 export function makeFetch<E extends Env>(build: (env: E) => Bot, stats: (env: E) => Promise<FleetStats>) {
   return async (req: Request, env: E): Promise<Response> => {
