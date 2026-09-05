@@ -1,6 +1,6 @@
 # HabitStreakProBot — habit tracker bot for Telegram
 
-**Try it:** [@HabitStreakProBot](https://t.me/HabitStreakProBot) · [tg.zovo.one/bots/habit/](https://tg.zovo.one/bots/habit/)
+**Try it:** [@HabitStreakProBot](https://t.me/HabitStreakProBot?start=github) · [tg.zovo.one/bots/habit/](https://tg.zovo.one/bots/habit/)
 
 ## What it does
 
