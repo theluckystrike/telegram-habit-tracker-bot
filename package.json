@@ -1,5 +1,6 @@
 {
   "name": "habitstreak-bot",
+  "repository": {"type": "git", "url": "theluckystrike/telegram-habit-tracker-bot.git"},
   "private": true,
   "type": "module",
   "scripts": {
